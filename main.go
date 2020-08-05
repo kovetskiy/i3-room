@@ -450,6 +450,14 @@ loop:
 			)
 		}
 
+		_, err = i3.Command(fmt.Sprintf("[id=%d] resize set 60 ppt", event.Container.Window))
+		if err != nil {
+			return karma.Format(
+				err,
+				"unable to resize window",
+			)
+		}
+
 		ghostsMap[target.Name] = []int{left, right}
 		return nil
 	}
