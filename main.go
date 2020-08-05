@@ -437,9 +437,11 @@ loop:
 			return err
 		}
 
-		err = moveGhost(i3, right, "right")
-		if err != nil {
-			return err
+		for i := 0; i < 3; i++ {
+			err = moveGhost(i3, right, "right")
+			if err != nil {
+				return err
+			}
 		}
 
 		_, err = i3.Command(fmt.Sprintf("[id=%d] focus", event.Container.Window))
