@@ -299,6 +299,8 @@ func main() {
 
 	defer i3.Close()
 
+	log.SetLevel(log.LevelDebug)
+
 	windows, err := i3ipc.Subscribe(i3ipc.I3WindowEvent)
 	if err != nil {
 		log.Fatalf(err, "unable to subscribe for i3 window events")
@@ -322,26 +324,30 @@ func main() {
 				log.Fatalf(err, "unable to get i3 tree")
 			}
 
-			toggle(i3, root, event)
+			err = toggle(i3, root, event)
+			if err != nil {
+				log.Fatal(err)
+			}
 		}
 	}
 }
 
-func match(node i3ipc.I3Node, win int) bool {
+func findWindow(node i3ipc.I3Node, win int) (*i3ipc.I3Node, *i3ipc.I3Node) {
 	for _, sub := range node.Nodes {
 		if int(sub.Window) == win {
-			return true
+			return &node, &sub
 		}
 
-		if match(sub, win) {
-			return true
+		parent, found := findWindow(sub, win)
+		if found != nil {
+			return parent, found
 		}
 	}
 
-	return false
+	return nil, nil
 }
 
-func count(node i3ipc.I3Node) (int, int) {
+func count(node *i3ipc.I3Node) (int, int) {
 	var windows int
 	var ghosts int
 	for _, sub := range node.Nodes {
@@ -354,7 +360,7 @@ func count(node i3ipc.I3Node) (int, int) {
 		}
 
 		if len(sub.Nodes) != 0 {
-			subWindows, subGhosts := count(sub)
+			subWindows, subGhosts := count(&sub)
 
 			windows += subWindows
 			ghosts += subGhosts
@@ -364,14 +370,10 @@ func count(node i3ipc.I3Node) (int, int) {
 	return windows, ghosts
 }
 
-func toggle(i3 *i3ipc.IPCSocket, root i3ipc.I3Node, event WindowFocusEvent) error {
+func getWorkspace(root i3ipc.I3Node, match func(node i3ipc.I3Node) bool) *i3ipc.I3Node {
 	const BLOCK_CONTENT = "content"
 	const WORKSPACE_SCRATCHPAD = "__i3_scratch"
 
-	var target i3ipc.I3Node
-	var found bool
-
-loop:
 	for _, output := range root.Nodes {
 		for _, block := range output.Nodes {
 			if block.Name == BLOCK_CONTENT {
@@ -380,33 +382,60 @@ loop:
 						continue
 					}
 
-					if match(workspace, event.Container.Window) {
-						found = true
-						target = workspace
-						break loop
+					if match(workspace) {
+						return &workspace
 					}
 				}
 			}
 		}
 	}
 
-	if !found {
+	return nil
+}
+
+func toggle(i3 *i3ipc.IPCSocket, root i3ipc.I3Node, event WindowFocusEvent) error {
+	var parent *i3ipc.I3Node
+	var window *i3ipc.I3Node
+	target := getWorkspace(root, func(node i3ipc.I3Node) bool {
+		parent, window = findWindow(node, event.Container.Window)
+		return window != nil
+	})
+
+	if target == nil {
+		log.Debugf(nil, "unable to find workspace with current window")
 		return nil
 	}
 
+	log.Debugf(
+		nil,
+		"found workspace %q with window %d %q",
+		target.Name,
+		event.Container.Window,
+		event.Container.Name,
+	)
+
 	windows, ghosts := count(target)
+
+	log.Debugf(nil, "windows: %d ghosts: %d", windows, ghosts)
 
 	if windows == 1 && ghosts == 1 || windows > 1 {
 		cached, ok := ghostsMap[target.Name]
+
+		log.Debugf(nil, "going to destroy ghosts: cached=%v has=%v", cached, ok)
+
 		if !ok {
 			return nil
 		}
 
 		for _, id := range cached {
+			log.Debugf(nil, "going to destroy %d", id)
+
 			if int64(id) == event.Container.ID {
+				log.Debugf(nil, "this container is already taken by current window")
 				continue
 			}
 
+			log.Debugf(nil, "kill %d", id)
 			_, err := i3.Command(fmt.Sprintf("[con_id=%d] kill", id))
 			if err != nil {
 				return karma.Format(
@@ -422,49 +451,83 @@ loop:
 	}
 
 	if windows == 1 && ghosts == 0 {
-		left, err := newGhost(i3)
+		log.Debugf(nil, "zero ghosts, spawning new ones")
+
+		left, right, err := spawnGhosts(i3, root, event.Container.Window)
 		if err != nil {
 			return err
-		}
-
-		err = moveGhost(i3, left, "left")
-		if err != nil {
-			return err
-		}
-
-		right, err := newGhost(i3)
-		if err != nil {
-			return err
-		}
-
-		for i := 0; i < 3; i++ {
-			err = moveGhost(i3, right, "right")
-			if err != nil {
-				return err
-			}
-		}
-
-		_, err = i3.Command(fmt.Sprintf("[id=%d] focus", event.Container.Window))
-		if err != nil {
-			return karma.Format(
-				err,
-				"unable to focus window",
-			)
-		}
-
-		_, err = i3.Command(fmt.Sprintf("[id=%d] resize set 60 ppt", event.Container.Window))
-		if err != nil {
-			return karma.Format(
-				err,
-				"unable to resize window",
-			)
 		}
 
 		ghostsMap[target.Name] = []int{left, right}
+
 		return nil
 	}
 
 	return nil
+}
+
+func spawnGhosts(i3 *i3ipc.IPCSocket, root i3ipc.I3Node, window int) (int, int, error) {
+	left, err := newGhost(i3)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	err = moveGhost(i3, left, "left")
+	if err != nil {
+		return 0, 0, err
+	}
+
+	right, err := newGhost(i3)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	err = moveGhost(i3, right, "right")
+	if err != nil {
+		return 0, 0, err
+	}
+
+	var actualWindow *i3ipc.I3Node
+	var containerWindow *i3ipc.I3Node
+	workspace := getWorkspace(root, func(node i3ipc.I3Node) bool {
+		containerWindow, actualWindow = findWindow(node, window)
+		return actualWindow != nil
+	})
+
+	if workspace == nil {
+		return 0, 0, fmt.Errorf("unable to find workspace with window")
+	}
+
+	if workspace.Nodes[0].Layout == "splitv" ||
+		actualWindow.Layout == "splitv" ||
+		containerWindow.Layout == "splitv" {
+		err = moveGhost(i3, right, "right")
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+
+	_, err = i3.Command(
+		fmt.Sprintf("[id=%d] focus", window),
+	)
+	if err != nil {
+		return 0, 0, karma.Format(
+			err,
+			"unable to focus window",
+		)
+	}
+
+	_, err = i3.Command(
+		fmt.Sprintf("[id=%d] resize set 60 ppt", window),
+	)
+	if err != nil {
+		return 0, 0, karma.Format(
+			err,
+			"unable to resize window",
+		)
+	}
+
+	return left, right, nil
 }
 
 func moveGhost(i3 *i3ipc.IPCSocket, id int, direction string) error {
