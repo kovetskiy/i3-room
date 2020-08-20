@@ -3,7 +3,13 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"regexp"
 
+	"gopkg.in/yaml.v3"
+
+	"github.com/docopt/docopt-go"
+	"github.com/kovetskiy/ko"
 	"github.com/reconquest/karma-go"
 	"github.com/reconquest/pkg/log"
 
@@ -291,7 +297,37 @@ type WorkspaceFocusEvent struct {
 
 var ghostsMap = map[string][]int{}
 
+var (
+	version = "[manual build]"
+	usage   = "i3-room " + version + os.ExpandEnv(`
+
+Usage:
+  i3-room [options]
+  i3-room -h | --help
+  i3-room --version
+
+Options:
+  -c --config <path>  Use specified config. [default: $HOME/.config/i3-room.conf]
+  -h --help           Show this screen.
+  --version           Show version.
+`)
+)
+
 func main() {
+	args, err := docopt.Parse(usage, nil, true, version, false)
+	if err != nil {
+		panic(err)
+	}
+
+	var config struct {
+		ExludeWindows []string `yaml:"exlude_windows"`
+	}
+
+	err = ko.Load(args["--config"].(string), &config, yaml.Unmarshal, ko.RequireFile(false))
+	if err != nil {
+		log.Fatalf(err, "unable to load config")
+	}
+
 	i3, err := i3ipc.GetIPCSocket()
 	if err != nil {
 		log.Fatalf(err, "unable to get ipc socket")
@@ -306,6 +342,7 @@ func main() {
 		log.Fatalf(err, "unable to subscribe for i3 window events")
 	}
 
+watch:
 	for {
 		select {
 		case windowEvent := <-windows:
@@ -317,6 +354,17 @@ func main() {
 			err := json.Unmarshal(windowEvent.Payload, &event)
 			if err != nil {
 				log.Fatalf(err, "unable to unmarshal window focus event")
+			}
+
+			for _, pattern := range config.ExludeWindows {
+				matched, err := regexp.MatchString(pattern, event.Container.Name)
+				if err != nil {
+					log.Fatalf(err, "unable to match pattern: %q", pattern)
+				}
+
+				if matched {
+					continue watch
+				}
 			}
 
 			root, err := i3.GetTree()
